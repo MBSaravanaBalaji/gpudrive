@@ -59,14 +59,17 @@ def render_episodes(
     n_videos: int = 5,
     zoom: int = 50,
     max_rollouts: int = 200,
+    data_dir: str = CrashVecEnv.DATA_DIR,
+    dataset_size: int = 50,
 ):
     os.makedirs(VIDEO_DIR, exist_ok=True)
-    print(f"\n=== Rendering {crash_type.upper()} ===", flush=True)
+    print(f"\n=== Rendering {crash_type.upper()} | data={data_dir} ===", flush=True)
 
     env = CrashVecEnv(
         crash_type=crash_type,
         num_worlds=TRAIN_NUM_WORLDS,
-        dataset_size=50,
+        data_dir=data_dir,
+        dataset_size=dataset_size,
         seed=TRAIN_SEED,
         device="cpu",
     )
@@ -129,14 +132,24 @@ def render_episodes(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--crash_types", nargs="+", default=["ssl", "ssr"],
+    parser.add_argument("--crash_types",  nargs="+", default=["ssl", "ssr"],
                         choices=["ssl", "ssr", "re"])
-    parser.add_argument("--n_videos", type=int, default=5)
-    parser.add_argument("--zoom",     type=int, default=50)
+    parser.add_argument("--n_videos",     type=int, default=5)
+    parser.add_argument("--zoom",         type=int, default=50)
+    parser.add_argument("--data_dir",     type=str, default=CrashVecEnv.DATA_DIR,
+                        help="Path to processed scene JSONs (e.g. data/processed/validation)")
+    parser.add_argument("--dataset_size", type=int, default=1500,
+                        help="Number of scenes to sample from data_dir")
     args = parser.parse_args()
 
     for ct in args.crash_types:
-        render_episodes(ct, n_videos=args.n_videos, zoom=args.zoom)
+        render_episodes(
+            ct,
+            n_videos=args.n_videos,
+            zoom=args.zoom,
+            data_dir=args.data_dir,
+            dataset_size=args.dataset_size,
+        )
 
 
 if __name__ == "__main__":
