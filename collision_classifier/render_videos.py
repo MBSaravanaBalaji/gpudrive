@@ -26,10 +26,9 @@ from collision_classifier.ppo_env import CrashVecEnv
 
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 VIDEO_DIR = os.path.join(os.path.dirname(__file__), "videos", "thread 1")
-# Must match training to get the same 4 scenes the policy was trained on
 TRAIN_NUM_WORLDS = 4
 TRAIN_SEED = 42
-FPS = 10
+FPS = 25  # matches Waymo's 25 Hz simulation rate
 
 
 def load_model(crash_type: str, env: CrashVecEnv) -> IPPO:
@@ -81,11 +80,14 @@ def render_episodes(
     rollout = 0
 
     while saved < n_videos and rollout < max_rollouts:
+        # Load a fresh batch of Waymo scenes each rollout for diversity.
+        # Without this, reset() just replays the same 4 scenes every time.
+        env._env.swap_data_batch()
+        obs = env.reset()
+
         # Per-world frame buffers and done flags for this rollout
         world_frames: list[list[np.ndarray]] = [[] for _ in range(num_worlds)]
-        world_done = [False] * num_worlds  # tracks first done per world this rollout
-
-        obs = env.reset()
+        world_done = [False] * num_worlds
 
         for step in range(ep_len + 1):
             # Render active (not yet done) worlds

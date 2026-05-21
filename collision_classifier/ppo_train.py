@@ -21,6 +21,8 @@ from types import SimpleNamespace
 import torch
 from stable_baselines3.common.callbacks import BaseCallback
 
+_DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 from gpudrive.integrations.sb3.ppo import IPPO
 from gpudrive.networks.basic_ffn import FFN, FeedForwardPolicy
 
@@ -36,12 +38,14 @@ class CrashCallback(BaseCallback):
         crash_type: str,
         log_every: int = 5_000,
         save_every: int = 50_000,
+        resample_scenes: bool = False,
     ):
         super().__init__(verbose=0)
         self.env = env
         self.crash_type = crash_type
         self.log_every = log_every
         self.save_every = save_every
+        self.resample_scenes = resample_scenes
         self.best_crash_rate = 0.0
         self.t0 = time.time()
 
@@ -76,24 +80,26 @@ class CrashCallback(BaseCallback):
         return True
 
     def _on_rollout_end(self) -> None:
-        pass
+        if self.resample_scenes:
+            self.env.swap_scenes()
 
 
 def train(
     crash_type: str,
-    num_worlds: int = 10,
+    num_worlds: int = 64,
     total_steps: int = 500_000,
     data_dir: str = CrashVecEnv.DATA_DIR,
     dataset_size: int = 50,
     seed: int = 42,
     log_every: int = 5_000,
     save_every: int = 50_000,
-    device: str = "cpu",
+    device: str = _DEFAULT_DEVICE,
+    resample_scenes: bool = False,
 ):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     print(f"\n=== PPO Training crash NPC: {crash_type.upper()} ===")
-    print(f"  total_steps={total_steps}  num_worlds={num_worlds}  device={device}\n")
+    print(f"  total_steps={total_steps}  num_worlds={num_worlds}  device={device}  resample_scenes={resample_scenes}\n")
 
     env = CrashVecEnv(
         crash_type=crash_type,
@@ -137,6 +143,7 @@ def train(
         crash_type=crash_type,
         log_every=log_every,
         save_every=save_every,
+        resample_scenes=resample_scenes,
     )
 
     model.learn(total_timesteps=total_steps, callback=callback)
@@ -150,14 +157,16 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--crash_type",    type=str, required=True, choices=["ssl", "ssr", "re"])
-    parser.add_argument("--num_worlds",    type=int, default=10)
+    parser.add_argument("--num_worlds",    type=int, default=64)
     parser.add_argument("--total_steps",   type=int, default=500_000)
     parser.add_argument("--data_dir",      type=str, default=CrashVecEnv.DATA_DIR)
     parser.add_argument("--dataset_size",  type=int, default=50)
     parser.add_argument("--seed",          type=int, default=42)
     parser.add_argument("--log_every",     type=int, default=5_000)
-    parser.add_argument("--save_every",    type=int, default=50_000)
-    parser.add_argument("--device",        type=str, default="cpu")
+    parser.add_argument("--save_every",       type=int,  default=50_000)
+    parser.add_argument("--device",           type=str,  default=_DEFAULT_DEVICE)
+    parser.add_argument("--resample_scenes",  action="store_true",
+                        help="Swap in new Waymo scenes after every PPO rollout for generalization")
     args = parser.parse_args()
 
     train(
@@ -170,4 +179,5 @@ if __name__ == "__main__":
         log_every=args.log_every,
         save_every=args.save_every,
         device=args.device,
+        resample_scenes=args.resample_scenes,
     )
