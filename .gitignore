@@ -1,4 +1,5 @@
 /build
+/.venv_waymo
 /out
 /build-debug
 /.vs
