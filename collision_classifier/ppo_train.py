@@ -54,6 +54,7 @@ class CrashCallback(BaseCallback):
 
         if n % self.log_every == 0 and n > 0:
             rate = self.env.crash_rate()
+            contact_rate = self.env.target_contact_rate()
             elapsed = time.time() - self.t0
             sps = n / elapsed
 
@@ -62,8 +63,12 @@ class CrashCallback(BaseCallback):
                 label_counts[l] = label_counts.get(l, 0) + 1
 
             ep = len(self.env.crash_hits)
+            mean_len = self.env.mean_episode_len()
+            lane_align = self.env.mean_lane_align()
             print(
                 f"step={n:>7}  ep={ep:>5}  crash_rate={rate:.3f}  "
+                f"target_contact={contact_rate:.3f}  "
+                f"mean_len={mean_len:.1f}  lane_align={lane_align:.3f}  "
                 f"sps={sps:.0f}  labels={label_counts}"
             )
 

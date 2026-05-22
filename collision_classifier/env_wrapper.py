@@ -47,11 +47,11 @@ R_WRONG         = 0.0    # no penalty for wrong type — penalizing wrong crashe
 W_SHAPING       = 0.1    # per-step alignment shaping weight (small, just enough gradient)
 PROXIMITY_SCALE = 10.0   # distance (m) at which proximity ≈ 0.5
 
-# Target direction for each crash type in EGO's LOCAL frame (x=forward, y=right in GPUDrive)
+# Target direction for each crash type in EGO's LOCAL frame.
 # NPC should approach from this direction relative to ego
 _TARGET_DIRS = {
-    "ssl": np.array([ 0.0, -1.0]),  # NPC to ego's LEFT  (y<0 in GPUDrive)
-    "ssr": np.array([ 0.0, +1.0]),  # NPC to ego's RIGHT (y>0 in GPUDrive)
+    "ssl": np.array([ 0.0, -1.0]),  # classifier side-swipe-left
+    "ssr": np.array([ 0.0, +1.0]),  # classifier side-swipe-right
     "re":  np.array([-1.0,  0.0]),  # NPC behind ego     (x<0 in ego frame)
 }
 

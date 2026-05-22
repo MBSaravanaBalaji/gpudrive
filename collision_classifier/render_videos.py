@@ -96,9 +96,10 @@ def render_episodes(
             # Render active (not yet done) worlds
             for w in range(num_worlds):
                 if not world_done[w]:
+                    npc_idx = int(env._npc_idxs[w].item())
                     figs = env._env.vis.plot_simulator_state(
                         env_indices=[w],
-                        center_agent_indices=[0],
+                        center_agent_indices=[npc_idx],
                         zoom_radius=zoom,
                     )
                     world_frames[w].append(img_from_fig(figs[0]))
