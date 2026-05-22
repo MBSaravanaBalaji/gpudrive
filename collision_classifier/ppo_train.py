@@ -136,7 +136,7 @@ def train(
         vf_coef=0.5,
         clip_range=0.2,
         learning_rate=3e-4,
-        ent_coef=0.01,       # entropy bonus — keeps policy exploring
+        ent_coef=0.03,       # entropy bonus — keeps policy exploring; needs to be higher when terminal is sparse
         n_epochs=5,
         max_grad_norm=0.5,
         env_config=None,     # only needed for LateFusionNet

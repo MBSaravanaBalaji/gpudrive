@@ -42,7 +42,7 @@ _CRASH_TYPE_MAP = {
 }
 
 # ── Reward parameters (mirrors dqn_crasher/sat_reward_wrapper.py) ─────────────
-R_MATCH         = 10.0   # terminal bonus for correct crash type
+R_MATCH         = 25.0   # terminal bonus for correct crash type (must >> cumulative shaping)
 R_WRONG         = 0.0    # no penalty for wrong type — penalizing wrong crashes causes avoidance collapse
 W_SHAPING       = 0.1    # per-step alignment shaping weight (small, just enough gradient)
 PROXIMITY_SCALE = 10.0   # distance (m) at which proximity ≈ 0.5
