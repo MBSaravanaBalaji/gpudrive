@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import json
+import os
 
 import numpy as np
 import torch
@@ -39,17 +42,34 @@ from collision_classifier.env_wrapper import (
     PROXIMITY_SCALE,
 )
 
+try:
+    from data_utils.spawn_families import (
+        MIN_SUCCESS_STEP_BY_FAMILY,
+        infer_spawn_family_from_path,
+    )
+except ImportError:
+    MIN_SUCCESS_STEP_BY_FAMILY = {"unknown": 15}
+
+    def infer_spawn_family_from_path(path: str) -> str:
+        return "unknown"
+
+_DEFAULT_MIN_SUCCESS_STEP = {"ssl": 15, "ssr": 15, "re": 10}
+_SPAWN_NORM = 30.0
+
 _VEHICLE_SCALE = None
 _REALISTIC_ACCEL_VALUES = (0.5, 1.5, 2.5, 3.5)
 _REALISTIC_STEER_VALUES = (-0.2, 0.0, 0.2)
 W_LANE = 0.005
-MIN_SUCCESS_STEP = 45
+MIN_SUCCESS_STEP = 15
 MIN_EARLY_SUCCESS_REWARD = 3.0
-W_APPROACH = 0.02        # must be small: 91 steps × 0.02 × 0.3 ≈ 0.5 << R_MATCH
-W_REAR_BLOCK_PENALTY = 0.05
-R_REAR_SHORTCUT = 6.0
+W_APPROACH = 0.03        # dense side-swipe guidance; keep << R_MATCH over 91 steps
+W_REAR_BLOCK_PENALTY = 0.15
+R_REAR_SHORTCUT = 10.0
+R_OPPOSITE_SIDE = 8.0
 R_OFFROAD = 4.0
 IDEAL_SIDESWIPE_OFFSET = 2.0
+# Discrete action index: accel=0.5, steer=0.0 (mild forward, straight)
+PROBE_ACTION_IDX = 1
 
 
 def _vscale() -> float:
@@ -67,6 +87,7 @@ class CrashVecEnv(VecEnv):
     """
 
     OBS_DIM = 11
+    OBS_SPAWN_DIM = 4
     DATA_DIR = "data/processed/examples"
 
     def __init__(
@@ -77,9 +98,12 @@ class CrashVecEnv(VecEnv):
         dataset_size: int = 50,
         seed: int = 42,
         device: str = _DEFAULT_DEVICE,
+        spawn_cond: bool = False,
     ):
         assert crash_type in CRASH_TYPES, f"crash_type must be one of {CRASH_TYPES}"
         self.crash_type = crash_type
+        self.spawn_cond = spawn_cond
+        self.obs_dim = self.OBS_DIM + (self.OBS_SPAWN_DIM if spawn_cond else 0)
         self.target_labels = _CRASH_TYPE_MAP[crash_type]
         self.target_dir = np.array(_TARGET_DIRS[crash_type], dtype=np.float32)
         self.target_dir_t = torch.tensor(_TARGET_DIRS[crash_type], dtype=torch.float32)
@@ -129,7 +153,7 @@ class CrashVecEnv(VecEnv):
             device=device,
         )
 
-        observation_space = gym.spaces.Box(-np.inf, np.inf, (self.OBS_DIM,), np.float32)
+        observation_space = gym.spaces.Box(-np.inf, np.inf, (self.obs_dim,), np.float32)
         action_space = gym.spaces.Discrete(len(self._action_values))
         super().__init__(num_worlds, observation_space, action_space)
 
@@ -156,6 +180,18 @@ class CrashVecEnv(VecEnv):
         self.crash_labels_buf: List[Optional[str]] = []
         self.lane_align_buf: List[float] = []
         self.episode_len_buf: List[int] = []
+        self.spawn_family_buf: List[str] = []
+
+        self._spawn_rel_x = torch.zeros(num_worlds, dtype=torch.float32, device=device)
+        self._spawn_rel_y = torch.zeros(num_worlds, dtype=torch.float32, device=device)
+        self._spawn_angle = torch.zeros(num_worlds, dtype=torch.float32, device=device)
+        self._min_success_steps = torch.full(
+            (num_worlds,),
+            fill_value=_DEFAULT_MIN_SUCCESS_STEP.get(crash_type, MIN_SUCCESS_STEP),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._spawn_families: List[str] = ["unknown"] * num_worlds
 
     # ── VecEnv interface ──────────────────────────────────────────────────────
 
@@ -165,16 +201,30 @@ class CrashVecEnv(VecEnv):
             self._step_counts.zero_()
             self._refresh_controlled_agents()
             self._update_all_ego_targets()
+            self._load_spawn_metadata(list(range(self.num_worlds)))
         else:
             worlds = world_idx.tolist() if isinstance(world_idx, torch.Tensor) else list(world_idx)
             self._env.sim.reset(worlds)
             self._step_counts[world_idx] = 0
             self._update_ego_targets_for(worlds)
+            self._load_spawn_metadata(worlds)
         return self._get_obs()
 
     def swap_scenes(self):
         """Load a new batch of Waymo scenes from the data loader and full-reset."""
         self._env.swap_data_batch()
+        return self._finish_scene_load()
+
+    def load_scene_paths(self, paths: List[str]) -> torch.Tensor:
+        """Load an explicit list of scene JSON paths (one per world) and reset."""
+        if len(paths) != self.num_worlds:
+            raise ValueError(
+                f"Expected {self.num_worlds} scene paths, got {len(paths)}"
+            )
+        self._env.swap_data_batch(list(paths))
+        return self._finish_scene_load()
+
+    def _finish_scene_load(self) -> torch.Tensor:
         self._expert_actions = self._env.get_expert_actions()[0].to(self.device)
         self._refresh_controlled_agents()
         return self.reset()
@@ -205,12 +255,20 @@ class CrashVecEnv(VecEnv):
         timeout      = self._step_counts >= self.episode_len
 
         shaping  = self._compute_shaping(state)
-        terminal, crash_labels = self._compute_terminal(collided, state)
+        terminal, crash_labels, ego_features = self._compute_terminal(collided, state)
         terminal = terminal - R_OFFROAD * (offroad & ~collided).float()
         rewards  = shaping + terminal  # on device
 
         dones = collided | goal_reached | offroad | timeout
         lane_align = self._lane_alignment(state)
+        contact_lx_all = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        contact_ly_all = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
+        cos_h_all = torch.cos(state[self._arange, self._ego_idxs, 7])
+        sin_h_all = torch.sin(state[self._arange, self._ego_idxs, 7])
+        delta_x = state[self._arange, self._npc_idxs, 0] - state[self._arange, self._ego_idxs, 0]
+        delta_y = state[self._arange, self._npc_idxs, 1] - state[self._arange, self._ego_idxs, 1]
+        contact_lx_all = cos_h_all * delta_x + sin_h_all * delta_y
+        contact_ly_all = sin_h_all * delta_x - cos_h_all * delta_y
 
         # Collect stats before reset
         for w in range(self.num_worlds):
@@ -225,6 +283,7 @@ class CrashVecEnv(VecEnv):
                     self.target_contact_hits.append(0)
                 self.lane_align_buf.append(float(lane_align[w].item()))
                 self.episode_len_buf.append(int(self._step_counts[w].item()))
+                self.spawn_family_buf.append(self._spawn_families[w])
 
         obs = self._build_obs(state, speeds)
         done_worlds = torch.where(dones)[0]
@@ -245,6 +304,9 @@ class CrashVecEnv(VecEnv):
                 "npc_idx": int(npc_idxs_for_info[w].item()),
                 "ego_idx": int(ego_idxs_for_info[w].item()),
                 "lane_align": float(lane_align[w].item()),
+                "contact_lx": float(contact_lx_all[w].item()),
+                "contact_ly": float(contact_ly_all[w].item()),
+                "ego_contact_feature": ego_features[w],
             }
             for w in range(self.num_worlds)
         ]
@@ -310,7 +372,12 @@ class CrashVecEnv(VecEnv):
             torch.cos(rel_h), torch.sin(rel_h),
             ego_spd, dist,
             torch.cos(lane_rel_h), torch.sin(lane_rel_h),
-        ], dim=1)  # (W, 11) on device
+        ] + ([
+            self._spawn_rel_x / _SPAWN_NORM,
+            self._spawn_rel_y / _SPAWN_NORM,
+            torch.cos(self._spawn_angle),
+            torch.sin(self._spawn_angle),
+        ] if self.spawn_cond else []), dim=1)  # (W, obs_dim) on device
 
     # ── Reward ────────────────────────────────────────────────────────────────
 
@@ -327,48 +394,66 @@ class CrashVecEnv(VecEnv):
         cos_h = torch.cos(ego_h)
         sin_h = torch.sin(ego_h)
         lx =  cos_h * delta[:, 0] + sin_h * delta[:, 1]
-        ly = -sin_h * delta[:, 0] + cos_h * delta[:, 1]
+        ly = sin_h * delta[:, 0] - cos_h * delta[:, 1]  # + = ego's right (GPUDrive)
 
         lane_align = self._lane_alignment(state)
         lane_penalty = W_LANE * torch.clamp(lane_align - 1.0, max=0.0)
 
         if self.crash_type in ("ssl", "ssr"):
-            side = float(self.target_dir[1])
             contact_lx = torch.zeros_like(lx)
-            contact_ly = torch.full_like(ly, side * IDEAL_SIDESWIPE_OFFSET)
+            if self.crash_type == "ssl":
+                contact_ly = torch.full_like(ly, -IDEAL_SIDESWIPE_OFFSET)
+            else:
+                contact_ly = torch.full_like(ly, IDEAL_SIDESWIPE_OFFSET)
 
-            contact_dist = torch.sqrt((lx - contact_lx).pow(2) + (ly - contact_ly).pow(2))
             heading_align = torch.clamp(torch.cos(npc_h - ego_h), min=0.0, max=1.0)
 
-            longitudinal_score = torch.sigmoid((lx + 12.0) / 4.0)
+            # Lateral: hold target flank (±2 m).
             side_score = torch.exp(-((ly - contact_ly) / 2.0).pow(2))
-            contact_score = torch.exp(-contact_dist / 8.0)
-            approach = (0.4 * longitudinal_score * side_score + 0.6 * contact_score) * heading_align
 
-            rear_block = (
-                torch.sigmoid((-lx - 2.0) / 2.0)
-                * torch.exp(-(torch.abs(ly) / 2.0).pow(2))
+            # Longitudinal: reward alongside ego (lx≈0), not lingering behind.
+            alongside_score = torch.exp(-((lx / 5.0).pow(2)))
+
+            # Ramp reward as NPC pulls forward from behind-spawn toward alongside.
+            forward_pull = torch.sigmoid((lx + 6.0) / 3.0)
+
+            contact_dist = torch.sqrt((lx - contact_lx).pow(2) + (ly - contact_ly).pow(2))
+            contact_score = torch.exp(-contact_dist / 8.0)
+
+            approach = (
+                (0.5 * alongside_score + 0.25 * forward_pull) * side_score
+                + 0.25 * contact_score
+            ) * heading_align
+
+            # Strong penalty for closing from behind while on the correct flank.
+            rear_close = (
+                torch.sigmoid((-lx - 2.5) / 1.5)
+                * torch.sigmoid((18.0 - d) / 4.0)
+                * side_score
                 * heading_align
             )
-            shaping = W_APPROACH * approach - W_REAR_BLOCK_PENALTY * rear_block + lane_penalty
+            shaping = W_APPROACH * approach - W_REAR_BLOCK_PENALTY * rear_close + lane_penalty
         else:
-            safe_d = d.clamp(min=1e-6)
-            alignment = lx / safe_d * self.target_dir_t[0] + ly / safe_d * self.target_dir_t[1]
+            # RE: reward closing from behind with lateral alignment.
+            behind = torch.sigmoid((-lx - 3.0) / 4.0)
+            lateral = torch.exp(-(ly / 1.5).pow(2))
             proximity = 1.0 / (1.0 + d / PROXIMITY_SCALE)
-            shaping = W_SHAPING * alignment * proximity + lane_penalty
+            heading_align = torch.clamp(torch.cos(npc_h - ego_h), min=0.0, max=1.0)
+            shaping = W_SHAPING * behind * lateral * proximity * heading_align + lane_penalty
 
         shaping = shaping * (d >= 1e-6).float()
         return shaping
 
     def _compute_terminal(
         self, collided: torch.Tensor, state: torch.Tensor
-    ) -> Tuple[torch.Tensor, List[Optional[str]]]:
+    ) -> Tuple[torch.Tensor, List[Optional[str]], List[Optional[str]]]:
         terminal = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
         labels: List[Optional[str]] = [None] * self.num_worlds
+        ego_features: List[Optional[str]] = [None] * self.num_worlds
 
         collided_ws = torch.where(collided)[0]
         if len(collided_ws) == 0:
-            return terminal, labels
+            return terminal, labels, ego_features
 
         vs = _vscale()
         # Only pay the CPU transfer when there are actual collisions
@@ -390,10 +475,12 @@ class CrashVecEnv(VecEnv):
             )
             if target_result is not None:
                 label = target_result.collision_type
+                ego_features[w] = target_result.ego_feature
                 step_count = int(self._step_counts[w].item())
-                if label in self.target_labels and step_count < MIN_SUCCESS_STEP:
+                min_step = int(self._min_success_steps[w].item())
+                if label in self.target_labels and step_count < min_step:
                     labels[w] = f"too_early:{label}"
-                    progress = step_count / MIN_SUCCESS_STEP
+                    progress = step_count / max(min_step, 1)
                     terminal[w] = MIN_EARLY_SUCCESS_REWARD + (
                         R_MATCH - MIN_EARLY_SUCCESS_REWARD
                     ) * (progress * progress)
@@ -401,8 +488,15 @@ class CrashVecEnv(VecEnv):
                     labels[w] = label
                     if label in self.target_labels:
                         terminal[w] = R_MATCH
-                    elif self.crash_type in ("ssl", "ssr") and label in ("rear-end", "rear-ended"):
+                    elif self.crash_type in ("ssl", "ssr") and label in (
+                        "rear-end",
+                        "rear-ended",
+                    ):
                         terminal[w] = -R_REAR_SHORTCUT
+                    elif self.crash_type == "ssl" and label == "side-swipe-right":
+                        terminal[w] = -R_OPPOSITE_SIDE
+                    elif self.crash_type == "ssr" and label == "side-swipe-left":
+                        terminal[w] = -R_OPPOSITE_SIDE
                     else:
                         terminal[w] = -R_WRONG
                 continue
@@ -426,7 +520,7 @@ class CrashVecEnv(VecEnv):
                     labels[w] = f"non_target:{result.collision_type}"
                     break
 
-        return terminal, labels
+        return terminal, labels, ego_features
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -505,6 +599,29 @@ class CrashVecEnv(VecEnv):
         hits = self.target_contact_hits[-window:]
         return sum(hits) / max(len(hits), 1)
 
+    def ssl_collision_rate(self, window: int = 200) -> float:
+        """Mature target crashes / all labeled collision episodes in window."""
+        return self.target_collision_rate(window)
+
+    def target_collision_rate(self, window: int = 200) -> float:
+        """Mature target crashes / all labeled collision episodes in window."""
+        labels = self.crash_labels_buf[-window:]
+        if not labels:
+            return 0.0
+        hits = sum(1 for lab in labels if lab in self.target_labels)
+        return hits / len(labels)
+
+    def ssl_contact_collision_rate(self, window: int = 200) -> float:
+        """Any target contact (incl. too_early) / all labeled collision episodes."""
+        return self.target_contact_collision_rate(window)
+
+    def target_contact_collision_rate(self, window: int = 200) -> float:
+        labels = self.crash_labels_buf[-window:]
+        if not labels:
+            return 0.0
+        hits = sum(1 for lab in labels if self._is_target_contact_label(lab))
+        return hits / len(labels)
+
     def mean_lane_align(self, window: int = 200) -> float:
         values = self.lane_align_buf[-window:]
         return sum(values) / max(len(values), 1)
@@ -512,6 +629,76 @@ class CrashVecEnv(VecEnv):
     def mean_episode_len(self, window: int = 200) -> float:
         values = self.episode_len_buf[-window:]
         return sum(values) / max(len(values), 1)
+
+    def spawn_family_stats(self, window: int = 200) -> Dict[str, Dict[str, float]]:
+        """Per spawn_family mature-target rate and episode count in window."""
+        n = min(window, len(self.crash_hits))
+        if n == 0:
+            return {}
+        hits = self.crash_hits[-n:]
+        families = self.spawn_family_buf[-n:]
+        out: Dict[str, Dict[str, float]] = {}
+        for fam, hit in zip(families, hits):
+            bucket = out.setdefault(fam, {"episodes": 0, "mature_hits": 0})
+            bucket["episodes"] += 1
+            bucket["mature_hits"] += hit
+        for fam, bucket in out.items():
+            ep = max(bucket["episodes"], 1)
+            bucket["crash_rate"] = bucket["mature_hits"] / ep
+        return out
+
+    def _load_spawn_metadata(self, worlds: List[int]) -> None:
+        """Read spawn_family / rel offsets from scene JSON for each world."""
+        paths = getattr(self._env, "data_batch", None) or []
+        default_min = _DEFAULT_MIN_SUCCESS_STEP.get(self.crash_type, MIN_SUCCESS_STEP)
+        for w in worlds:
+            family = "unknown"
+            rel_x = 0.0
+            rel_y = 0.0
+            min_step = default_min
+            path = paths[w] if w < len(paths) else ""
+            if path:
+                try:
+                    with open(path) as f:
+                        meta = json.load(f).get("metadata", {}).get("crash_pair", {})
+                    family = meta.get("spawn_family") or infer_spawn_family_from_path(path)
+                    rel_x = float(meta.get("rel_x", 0.0))
+                    rel_y = float(meta.get("rel_y", 0.0))
+                    min_step = int(
+                        meta.get(
+                            "min_success_step",
+                            MIN_SUCCESS_STEP_BY_FAMILY.get(family, default_min),
+                        )
+                    )
+                except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                    family = infer_spawn_family_from_path(path)
+            self._spawn_families[w] = family
+            self._spawn_rel_x[w] = rel_x
+            self._spawn_rel_y[w] = rel_y
+            self._spawn_angle[w] = math.atan2(rel_y, rel_x) if (rel_x or rel_y) else 0.0
+            self._min_success_steps[w] = min_step
+
+        if self.spawn_cond:
+            self._fill_spawn_from_state(worlds)
+
+    def _fill_spawn_from_state(self, worlds: List[int]) -> None:
+        """If metadata lacks rel offsets, derive ego-frame spawn offsets from t=0."""
+        state = self._global_state()
+        for w in worlds:
+            if abs(float(self._spawn_rel_x[w].item())) > 1e-3 or abs(
+                float(self._spawn_rel_y[w].item())
+            ) > 1e-3:
+                continue
+            npc_xy = state[w, self._npc_idxs[w], :2]
+            ego_xy = state[w, self._ego_idxs[w], :2]
+            ego_h = state[w, self._ego_idxs[w], 7]
+            c, s = torch.cos(ego_h), torch.sin(ego_h)
+            delta = npc_xy - ego_xy
+            rel_x = float((c * delta[0] + s * delta[1]).item())
+            rel_y = float((s * delta[0] - c * delta[1]).item())
+            self._spawn_rel_x[w] = rel_x
+            self._spawn_rel_y[w] = rel_y
+            self._spawn_angle[w] = math.atan2(rel_y, rel_x) if (rel_x or rel_y) else 0.0
 
     def _is_target_contact_label(self, label: str) -> bool:
         if label in self.target_labels:

@@ -65,9 +65,11 @@ def compute_polygon(
 ) -> np.ndarray:
     """
     Build the 4 OBB corners (world frame) from a vehicle's state.
-    Matches RoadObject.polygon() from dqn_crasher (without closing the loop).
 
-    Vertex order: rear-left(0), rear-right(1), front-right(2), front-left(3)
+    Uses GPUDrive's body axes (see gpudrive/visualize/utils.py):
+      forward u = (cos h, sin h)
+      right   ut = (sin h, -cos h)
+    Body x = forward, body y = right.
     """
     corners = np.array([
         [-length / 2, -width / 2],  # rear-left
@@ -76,8 +78,14 @@ def compute_polygon(
         [+length / 2, -width / 2],  # front-left
     ])
     c, s = np.cos(heading), np.sin(heading)
-    R = np.array([[c, -s], [s, c]])
-    return (R @ corners.T).T + np.array([pos_x, pos_y])
+    # GPUDrive: world = center + x_body * u + y_body * ut
+    g = np.array([[c, s], [s, -c]])
+    return (g @ corners.T).T + np.array([pos_x, pos_y])
+
+
+def ego_frame_lateral(heading: float, dx: float, dy: float) -> float:
+    """Lateral NPC offset in ego frame; + = ego's right (matches GPUDrive render)."""
+    return np.sin(heading) * dx - np.cos(heading) * dy
 
 
 def compute_mtv(

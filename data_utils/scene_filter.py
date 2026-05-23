@@ -18,8 +18,20 @@ Usage:
       --crash_type all \\
       --num_workers 8
 
-  # dry run — stats only, no copying
-  python -m data_utils.scene_filter --input_dir data/processed/training --dry_run
+  # Synthetic multi-spawn (curriculum families)
+  python -m data_utils.scene_filter \\
+      --input_dir data/processed/training \\
+      --output_dir data/processed/multi_spawn \\
+      --crash_type ssl \\
+      --synthetic_spawn \\
+      --spawn_family all \\
+      --variants_per_scene 3 \\
+      --num_workers 8
+
+  # Validate written spawns (drivability smoke test)
+  python -m data_utils.validate_spawns \\
+      --data_dir data/processed/multi_spawn/training_ssl \\
+      --num_worlds 32
 """
 from __future__ import annotations
 
@@ -33,6 +45,13 @@ import shutil
 from dataclasses import dataclass, field
 from multiprocessing import Pool
 from typing import Dict, List, Optional, Tuple
+
+from data_utils.spawn_families import (
+    MIN_SUCCESS_STEP_BY_FAMILY,
+    SpawnEnvelope,
+    resolve_spawn_families,
+    spawn_envelopes,
+)
 
 try:
     from tqdm import tqdm
@@ -324,16 +343,14 @@ def _find_synthetic_pair(
     return npc_idx, ego_idx
 
 
-def _synthetic_spawn_params(crash_type: str, rng: random.Random) -> Tuple[float, float, float]:
+def _synthetic_spawn_params(
+    envelope: SpawnEnvelope,
+    rng: random.Random,
+) -> Tuple[float, float, float]:
     """Return (rel_x, rel_y, speed_delta) in ego frame where y>0 is ego's right."""
-    rel_x = rng.uniform(-20.0, -10.0)
-    if crash_type == "ssl":
-        rel_y = rng.uniform(-2.2, -1.6)  # near-side corridor that stays drivable
-    elif crash_type == "ssr":
-        rel_y = rng.uniform(1.6, 2.2)    # near-side corridor that stays drivable
-    else:
-        rel_y = rng.uniform(-0.8, 0.8)
-    speed_delta = rng.uniform(1.2, 2.6)
+    rel_x = rng.uniform(*envelope.rel_x)
+    rel_y = rng.uniform(*envelope.rel_y)
+    speed_delta = rng.uniform(*envelope.speed_delta)
     return rel_x, rel_y, speed_delta
 
 
@@ -341,6 +358,7 @@ def _scene_with_synthetic_spawn(
     scene: dict,
     pair: Tuple[int, int],
     crash_type: str,
+    spawn_family: str,
     variant_idx: int,
     rng: random.Random,
 ) -> dict:
@@ -354,11 +372,13 @@ def _scene_with_synthetic_spawn(
     if ego_pose is None:
         raise ValueError("synthetic spawn requires a valid ego pose")
     ego_x, ego_y, ego_h, ego_speed = ego_pose
-    rel_x, rel_y, speed_delta = _synthetic_spawn_params(crash_type, rng)
+    envelope = spawn_envelopes(crash_type)[spawn_family]
+    rel_x, rel_y, speed_delta = _synthetic_spawn_params(envelope, rng)
 
     c, s = math.cos(ego_h), math.sin(ego_h)
-    spawn_x = ego_x + c * rel_x - s * rel_y
-    spawn_y = ego_y + s * rel_x + c * rel_y
+    # GPUDrive body: forward u=(c,s), right ut=(s,-c); rel_y>0 → ego's right.
+    spawn_x = ego_x + c * rel_x + s * rel_y
+    spawn_y = ego_y + s * rel_x - c * rel_y
     spawn_h = ego_h + rng.uniform(-0.05, 0.05)
     spawn_speed = max(ego_speed + speed_delta, MIN_INITIAL_SPEED)
     vx = math.cos(spawn_h) * spawn_speed
@@ -400,10 +420,13 @@ def _scene_with_synthetic_spawn(
         "ego_id": ego.get("id"),
         "pair_only": True,
         "synthetic_spawn": True,
+        "spawn_family": spawn_family,
         "variant_idx": variant_idx,
         "rel_x": rel_x,
         "rel_y": rel_y,
+        "speed_delta": speed_delta,
         "spawn_speed": spawn_speed,
+        "min_success_step": MIN_SUCCESS_STEP_BY_FAMILY.get(spawn_family, 15),
     }
     out["metadata"] = metadata
     return out
@@ -507,6 +530,7 @@ def run(
     synthetic_spawn: bool = False,
     variants_per_scene: int = 1,
     spawn_seed: int = 42,
+    spawn_family: str = "default",
 ) -> None:
     json_files = sorted(
         os.path.join(root, f)
@@ -519,9 +543,15 @@ def run(
         return
 
     print(f"Found {len(json_files)} scenes in {input_dir}")
+    family_by_type = {
+        ct: resolve_spawn_families(ct, spawn_family if synthetic_spawn else "default")
+        for ct in crash_types
+    }
     print(
         f"Crash types: {crash_types}  |  strict={strict}  |  dry_run={dry_run}  |  "
-        f"synthetic_spawn={synthetic_spawn}  |  variants={variants_per_scene}  |  workers={num_workers}\n"
+        f"synthetic_spawn={synthetic_spawn}  |  spawn_family={spawn_family}  |  "
+        f"families={ {ct: family_by_type[ct] for ct in crash_types} }  |  "
+        f"variants={variants_per_scene}  |  workers={num_workers}\n"
     )
 
     if not dry_run:
@@ -539,7 +569,12 @@ def run(
         for result in tqdm(pool.imap_unordered(_worker, json_files), total=total, desc="filtering"):
             for ct in crash_types:
                 if result.viable.get(ct, False):
-                    counts[ct] += variants_per_scene if synthetic_spawn else 1
+                    n_written = (
+                        variants_per_scene * len(family_by_type[ct])
+                        if synthetic_spawn
+                        else 1
+                    )
+                    counts[ct] += n_written
                     if not dry_run:
                         with open(result.path) as f:
                             scene = json.load(f)
@@ -549,18 +584,21 @@ def run(
                             shutil.copy2(result.path, dst)
                         elif synthetic_spawn:
                             stem, ext = os.path.splitext(os.path.basename(result.path))
-                            for variant_idx in range(variants_per_scene):
-                                rng = random.Random(f"{spawn_seed}:{result.path}:{ct}:{variant_idx}")
-                                dst = os.path.join(
-                                    output_dir,
-                                    f"training_{ct}",
-                                    f"{stem}_syn{variant_idx:02d}{ext}",
-                                )
-                                spawned = _scene_with_synthetic_spawn(
-                                    scene, pair, ct, variant_idx, rng
-                                )
-                                with open(dst, "w") as f:
-                                    json.dump(spawned, f)
+                            for family in family_by_type[ct]:
+                                for variant_idx in range(variants_per_scene):
+                                    rng = random.Random(
+                                        f"{spawn_seed}:{result.path}:{ct}:{family}:{variant_idx}"
+                                    )
+                                    dst = os.path.join(
+                                        output_dir,
+                                        f"training_{ct}",
+                                        f"{stem}_{family}_syn{variant_idx:02d}{ext}",
+                                    )
+                                    spawned = _scene_with_synthetic_spawn(
+                                        scene, pair, ct, family, variant_idx, rng
+                                    )
+                                    with open(dst, "w") as f:
+                                        json.dump(spawned, f)
                         else:
                             dst = os.path.join(output_dir, f"training_{ct}", os.path.basename(result.path))
                             with open(dst, "w") as f:
@@ -592,6 +630,15 @@ def main() -> None:
                         help="Synthetic spawn variants to write per source scene")
     parser.add_argument("--spawn_seed", type=int, default=42,
                         help="Seed for deterministic synthetic spawn variants")
+    parser.add_argument(
+        "--spawn_family",
+        type=str,
+        default="default",
+        help=(
+            "Synthetic spawn families: default (behind_near only), all, or "
+            "comma-separated list (behind_near,behind_far,side_same,side_opposite,ahead)"
+        ),
+    )
     args = parser.parse_args()
 
     crash_types = CRASH_TYPES if args.crash_type == "all" else [args.crash_type]
@@ -606,6 +653,7 @@ def main() -> None:
         synthetic_spawn=args.synthetic_spawn,
         variants_per_scene=args.variants_per_scene,
         spawn_seed=args.spawn_seed,
+        spawn_family=args.spawn_family,
     )
 
 
