@@ -61,15 +61,43 @@ _REALISTIC_ACCEL_VALUES = (0.5, 1.5, 2.5, 3.5)
 _REALISTIC_STEER_VALUES = (-0.2, 0.0, 0.2)
 W_LANE = 0.005
 MIN_SUCCESS_STEP = 15
-MIN_EARLY_SUCCESS_REWARD = 3.0
 W_APPROACH = 0.03        # dense side-swipe guidance; keep << R_MATCH over 91 steps
 W_REAR_BLOCK_PENALTY = 0.15
+W_EARLY_CLOSE = 0.12     # per-step penalty when closing within 10 m before min_success_step
+R_TOO_EARLY = 12.0       # terminal penalty for correct-type contact before min_success_step
 R_REAR_SHORTCUT = 10.0
 R_OPPOSITE_SIDE = 8.0
 R_OFFROAD = 4.0
+MIN_BEHIND_SPAWN_GAP = 10.0  # meters; used to gate contact shaping while still behind ego
 IDEAL_SIDESWIPE_OFFSET = 2.0
 # Discrete action index: accel=0.5, steer=0.0 (mild forward, straight)
 PROBE_ACTION_IDX = 1
+
+
+def _filter_spawn_family_paths(
+    paths: List[str],
+    spawn_family: str,
+) -> List[str]:
+    """Drop synthetic scenes whose initial spawn is too close for the family."""
+    limits = {
+        "behind_near": -11.0,
+        "behind_far": -15.0,
+    }
+    min_rel_x = limits.get(spawn_family)
+    if min_rel_x is None:
+        return paths
+    kept: List[str] = []
+    for path in paths:
+        try:
+            with open(path) as f:
+                meta = json.load(f).get("metadata", {}).get("crash_pair", {})
+            rel_x = float(meta.get("rel_x", 0.0))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            kept.append(path)
+            continue
+        if rel_x <= min_rel_x:
+            kept.append(path)
+    return kept if kept else paths
 
 
 def _vscale() -> float:
@@ -99,11 +127,13 @@ class CrashVecEnv(VecEnv):
         seed: int = 42,
         device: str = _DEFAULT_DEVICE,
         spawn_cond: bool = False,
+        spawn_family: str | None = None,
+        late_fusion: bool = False,
     ):
         assert crash_type in CRASH_TYPES, f"crash_type must be one of {CRASH_TYPES}"
         self.crash_type = crash_type
         self.spawn_cond = spawn_cond
-        self.obs_dim = self.OBS_DIM + (self.OBS_SPAWN_DIM if spawn_cond else 0)
+        self.late_fusion = late_fusion
         self.target_labels = _CRASH_TYPE_MAP[crash_type]
         self.target_dir = np.array(_TARGET_DIRS[crash_type], dtype=np.float32)
         self.target_dir_t = torch.tensor(_TARGET_DIRS[crash_type], dtype=torch.float32)
@@ -112,24 +142,63 @@ class CrashVecEnv(VecEnv):
 
         config = EnvConfig(
             dynamics_model="classic",
-            collision_behavior="stop",
+            collision_behavior="ignore",  # training: NPC keeps moving after early taps
             max_controlled_agents=1,
             num_worlds=num_worlds,
             ego_state=True,
-            road_map_obs=False,
-            partner_obs=False,
-            norm_obs=False,
+            road_map_obs=late_fusion,
+            partner_obs=late_fusion,
+            norm_obs=late_fusion,
+            obs_radius=50.0 if late_fusion else 50.0,
         )
+        self.env_config = config
 
-        data_loader = SceneDataLoader(
-            root=data_dir,
-            batch_size=num_worlds,
-            dataset_size=dataset_size,
-            sample_with_replacement=True,
-            shuffle=True,
-            seed=seed,
-            file_prefix="tfrecord",
-        )
+        if spawn_family is not None:
+            needle = f"_{spawn_family}_"
+            family_paths = [
+                os.path.join(data_dir, scene)
+                for scene in sorted(os.listdir(data_dir))
+                if scene.startswith("tfrecord") and needle in scene
+            ]
+            if not family_paths:
+                raise FileNotFoundError(
+                    f"No scenes matching spawn_family={spawn_family!r} under {data_dir}"
+                )
+            n_before = len(family_paths)
+            family_paths = _filter_spawn_family_paths(family_paths, spawn_family)
+            if len(family_paths) < n_before:
+                print(
+                    f"  spawn filter ({spawn_family}): "
+                    f"{len(family_paths)}/{n_before} scenes kept"
+                )
+            effective_size = min(dataset_size, len(family_paths))
+            data_loader = SceneDataLoader(
+                root=data_dir,
+                batch_size=num_worlds,
+                dataset_size=effective_size,
+                sample_with_replacement=True,
+                shuffle=True,
+                seed=seed,
+                file_prefix="tfrecord",
+            )
+            data_loader.dataset = family_paths[:effective_size]
+            if data_loader.shuffle:
+                data_loader.random_gen.shuffle(data_loader.dataset)
+            print(
+                f"  spawn_family={spawn_family}  scenes={len(data_loader.dataset)}"
+            )
+        else:
+            data_loader = SceneDataLoader(
+                root=data_dir,
+                batch_size=num_worlds,
+                dataset_size=dataset_size,
+                sample_with_replacement=True,
+                shuffle=True,
+                seed=seed,
+                file_prefix="tfrecord",
+            )
+
+        self.spawn_family = spawn_family
 
         self._env = GPUDriveTorchEnv(
             config=config,
@@ -142,6 +211,14 @@ class CrashVecEnv(VecEnv):
 
         self.max_agent_count = self._env.max_agent_count
         self.episode_len = self._env.episode_len
+        if late_fusion:
+            self._native_obs_dim = int(self._env.observation_space.shape[0])
+            self.obs_dim = self._native_obs_dim + (
+                self.OBS_SPAWN_DIM if spawn_cond else 0
+            )
+            print(f"  late_fusion obs: native={self._native_obs_dim}  total={self.obs_dim}")
+        else:
+            self.obs_dim = self.OBS_DIM + (self.OBS_SPAWN_DIM if spawn_cond else 0)
         self._expert_actions = self._env.get_expert_actions()[0].to(device)
         self._action_values = torch.tensor(
             [
@@ -192,6 +269,9 @@ class CrashVecEnv(VecEnv):
             device=device,
         )
         self._spawn_families: List[str] = ["unknown"] * num_worlds
+        self._immature_penalized = torch.zeros(
+            num_worlds, dtype=torch.bool, device=device
+        )
 
     # ── VecEnv interface ──────────────────────────────────────────────────────
 
@@ -199,6 +279,7 @@ class CrashVecEnv(VecEnv):
         if world_idx is None:
             self._env.reset()
             self._step_counts.zero_()
+            self._immature_penalized.zero_()
             self._refresh_controlled_agents()
             self._update_all_ego_targets()
             self._load_spawn_metadata(list(range(self.num_worlds)))
@@ -206,6 +287,7 @@ class CrashVecEnv(VecEnv):
             worlds = world_idx.tolist() if isinstance(world_idx, torch.Tensor) else list(world_idx)
             self._env.sim.reset(worlds)
             self._step_counts[world_idx] = 0
+            self._immature_penalized[world_idx] = False
             self._update_ego_targets_for(worlds)
             self._load_spawn_metadata(worlds)
         return self._get_obs()
@@ -257,9 +339,34 @@ class CrashVecEnv(VecEnv):
         shaping  = self._compute_shaping(state)
         terminal, crash_labels, ego_features = self._compute_terminal(collided, state)
         terminal = terminal - R_OFFROAD * (offroad & ~collided).float()
-        rewards  = shaping + terminal  # on device
 
-        dones = collided | goal_reached | offroad | timeout
+        immature_contact = torch.zeros(
+            self.num_worlds, dtype=torch.bool, device=self.device
+        )
+        for w in range(self.num_worlds):
+            label = crash_labels[w]
+            if collided[w] and label is not None and label.startswith("too_early:"):
+                immature_contact[w] = True
+
+        first_immature = immature_contact & ~self._immature_penalized
+        repeat_immature = immature_contact & self._immature_penalized
+        terminal = torch.where(repeat_immature, torch.zeros_like(terminal), terminal)
+        terminal = torch.where(
+            first_immature,
+            torch.full_like(terminal, -R_TOO_EARLY),
+            terminal,
+        )
+        self._immature_penalized |= immature_contact
+
+        delta_xy = state[self._arange, self._npc_idxs, :2] - state[self._arange, self._ego_idxs, :2]
+        dist = torch.linalg.norm(delta_xy, dim=1)
+        early_close = (
+            self._step_counts < self._min_success_steps
+        ) & (dist < 10.0)
+        rewards = shaping + terminal - W_EARLY_CLOSE * early_close.float()
+
+        collision_done = collided & ~immature_contact
+        dones = collision_done | goal_reached | offroad | timeout
         lane_align = self._lane_alignment(state)
         contact_lx_all = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
         contact_ly_all = torch.zeros(self.num_worlds, dtype=torch.float32, device=self.device)
@@ -274,7 +381,7 @@ class CrashVecEnv(VecEnv):
         for w in range(self.num_worlds):
             if dones[w]:
                 label = crash_labels[w]
-                if collided[w].item() and label is not None:
+                if collision_done[w].item() and label is not None:
                     self.crash_labels_buf.append(label)
                     self.crash_hits.append(1 if label in self.target_labels else 0)
                     self.target_contact_hits.append(1 if self._is_target_contact_label(label) else 0)
@@ -285,7 +392,7 @@ class CrashVecEnv(VecEnv):
                 self.episode_len_buf.append(int(self._step_counts[w].item()))
                 self.spawn_family_buf.append(self._spawn_families[w])
 
-        obs = self._build_obs(state, speeds)
+        obs = self._get_obs(state, speeds)
         done_worlds = torch.where(dones)[0]
         npc_idxs_for_info = self._npc_idxs.clone()
         ego_idxs_for_info = self._ego_idxs.clone()
@@ -293,7 +400,7 @@ class CrashVecEnv(VecEnv):
             self.reset(done_worlds)
             fresh_state  = self._global_state()
             fresh_speeds = self._local_speeds()
-            obs[done_worlds] = self._build_obs(fresh_state, fresh_speeds)[done_worlds]
+            obs[done_worlds] = self._get_obs(fresh_state, fresh_speeds)[done_worlds]
 
         info_list = [
             {
@@ -341,8 +448,30 @@ class CrashVecEnv(VecEnv):
 
     # ── Observation ───────────────────────────────────────────────────────────
 
-    def _get_obs(self) -> torch.Tensor:
-        return self._build_obs(self._global_state(), self._local_speeds())
+    def _get_obs(
+        self,
+        state: torch.Tensor | None = None,
+        speeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if state is None:
+            state = self._global_state()
+        if speeds is None:
+            speeds = self._local_speeds()
+        if self.late_fusion:
+            full = self._env.get_obs()
+            obs = full[self._arange, self._npc_idxs]
+            if self.spawn_cond:
+                obs = torch.cat([obs, self._spawn_features()], dim=1)
+            return obs
+        return self._build_obs(state, speeds)
+
+    def _spawn_features(self) -> torch.Tensor:
+        return torch.stack([
+            self._spawn_rel_x / _SPAWN_NORM,
+            self._spawn_rel_y / _SPAWN_NORM,
+            torch.cos(self._spawn_angle),
+            torch.sin(self._spawn_angle),
+        ], dim=1)
 
     def _build_obs(self, state: torch.Tensor, speeds: torch.Tensor) -> torch.Tensor:
         """Vectorized 11-float obs, stays on device — no Python loop."""
@@ -365,19 +494,17 @@ class CrashVecEnv(VecEnv):
         lane_h = self._ego_start_h
         lane_rel_h = ((npc_h - lane_h + math.pi) % (2 * math.pi)) - math.pi
 
-        return torch.stack([
+        base = torch.stack([
             npc_spd,
             torch.cos(npc_h), torch.sin(npc_h),
             rel_x, rel_y,
             torch.cos(rel_h), torch.sin(rel_h),
             ego_spd, dist,
             torch.cos(lane_rel_h), torch.sin(lane_rel_h),
-        ] + ([
-            self._spawn_rel_x / _SPAWN_NORM,
-            self._spawn_rel_y / _SPAWN_NORM,
-            torch.cos(self._spawn_angle),
-            torch.sin(self._spawn_angle),
-        ] if self.spawn_cond else []), dim=1)  # (W, obs_dim) on device
+        ], dim=1)
+        if self.spawn_cond:
+            return torch.cat([base, self._spawn_features()], dim=1)
+        return base
 
     # ── Reward ────────────────────────────────────────────────────────────────
 
@@ -432,7 +559,27 @@ class CrashVecEnv(VecEnv):
                 * side_score
                 * heading_align
             )
-            shaping = W_APPROACH * approach - W_REAR_BLOCK_PENALTY * rear_close + lane_penalty
+            behind_spawn = self._spawn_rel_x < -8.0
+            ahead_spawn = self._spawn_rel_x > 8.0
+
+            catch_up = (
+                torch.sigmoid((lx + 8.0) / 4.0)
+                * side_score
+                * heading_align
+            )
+            # Do not reward "contact geometry" while still directly behind ego.
+            alongside = torch.sigmoid((lx + 2.0) / 2.0)
+            behind_shaping = W_APPROACH * (
+                0.6 * catch_up + 0.4 * contact_score * alongside
+            ) + lane_penalty
+            side_shaping = W_APPROACH * approach - W_REAR_BLOCK_PENALTY * rear_close + lane_penalty
+            ahead_shaping = W_APPROACH * (
+                torch.sigmoid((-lx - 4.0) / 3.0) * side_score * heading_align
+                + 0.3 * contact_score
+            ) + lane_penalty
+
+            shaping = torch.where(behind_spawn, behind_shaping, side_shaping)
+            shaping = torch.where(ahead_spawn, ahead_shaping, shaping)
         else:
             # RE: reward closing from behind with lateral alignment.
             behind = torch.sigmoid((-lx - 3.0) / 4.0)
@@ -480,10 +627,7 @@ class CrashVecEnv(VecEnv):
                 min_step = int(self._min_success_steps[w].item())
                 if label in self.target_labels and step_count < min_step:
                     labels[w] = f"too_early:{label}"
-                    progress = step_count / max(min_step, 1)
-                    terminal[w] = MIN_EARLY_SUCCESS_REWARD + (
-                        R_MATCH - MIN_EARLY_SUCCESS_REWARD
-                    ) * (progress * progress)
+                    terminal[w] = -R_TOO_EARLY
                 else:
                     labels[w] = label
                     if label in self.target_labels:
@@ -664,11 +808,9 @@ class CrashVecEnv(VecEnv):
                     family = meta.get("spawn_family") or infer_spawn_family_from_path(path)
                     rel_x = float(meta.get("rel_x", 0.0))
                     rel_y = float(meta.get("rel_y", 0.0))
+                    # Always use family table so reward timing stays in sync with code.
                     min_step = int(
-                        meta.get(
-                            "min_success_step",
-                            MIN_SUCCESS_STEP_BY_FAMILY.get(family, default_min),
-                        )
+                        MIN_SUCCESS_STEP_BY_FAMILY.get(family, default_min)
                     )
                 except (OSError, json.JSONDecodeError, TypeError, ValueError):
                     family = infer_spawn_family_from_path(path)

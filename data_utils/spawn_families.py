@@ -25,12 +25,12 @@ SPAWN_FAMILY_NAMES: Tuple[str, ...] = (
 
 # Suggested MIN_SUCCESS_STEP gates per family (used by ppo_env when spawn_cond on).
 MIN_SUCCESS_STEP_BY_FAMILY: Dict[str, int] = {
-    "behind_near": 15,
-    "behind_far": 18,
+    "behind_near": 25,
+    "behind_far": 28,
     "side_same": 22,
-    "side_opposite": 28,
-    "ahead": 30,
-    "unknown": 15,
+    "side_opposite": 30,
+    "ahead": 32,
+    "unknown": 20,
 }
 
 
@@ -41,17 +41,17 @@ class SpawnEnvelope:
     speed_delta: Tuple[float, float] = (1.2, 2.6)
 
 
-# Shared longitudinal bands
-_BEHIND_NEAR = SpawnEnvelope((-20.0, -10.0), (0.0, 0.0))  # rel_y filled per type
-_BEHIND_FAR = SpawnEnvelope((-35.0, -18.0), (0.0, 0.0))
-_SIDE_X = SpawnEnvelope((-8.0, 8.0), (0.0, 0.0))
-_AHEAD = SpawnEnvelope((8.0, 22.0), (0.0, 0.0))
+# Shared longitudinal bands (tightened for 91-step ego log reachability)
+_BEHIND_NEAR = SpawnEnvelope((-14.0, -10.0), (0.0, 0.0), (1.2, 2.8))
+_BEHIND_FAR = SpawnEnvelope((-22.0, -14.0), (0.0, 0.0), (2.0, 3.5))
+_SIDE_X = SpawnEnvelope((-6.0, 6.0), (0.0, 0.0), (1.2, 3.0))
+_AHEAD = SpawnEnvelope((5.0, 12.0), (0.0, 0.0), (0.5, 2.0))
 
 # Lateral bands per crash type (ego frame)
 _SSL_SAME_Y = (-2.2, -1.6)       # NPC left of ego
 _SSL_OPPOSITE_Y = (1.6, 2.2)     # NPC right of ego — must lane-change for SSL
 _SSR_SAME_Y = (1.6, 2.2)
-_SSR_OPPOSITE_Y = (-2.2, -1.6)
+_SSR_OPPOSITE_Y = (-1.8, -1.2)
 _RE_CENTER_Y = (-0.8, 0.8)
 _RE_AHEAD_Y = (-0.6, 0.6)
 _RE_AHEAD_SPEED = (-1.0, 0.5)    # slower or slightly faster when ahead
@@ -65,21 +65,21 @@ def spawn_envelopes(crash_type: str) -> Dict[str, SpawnEnvelope]:
         same_y, opp_y = _SSR_SAME_Y, _SSR_OPPOSITE_Y
     elif crash_type == "re":
         return {
-            "behind_near": SpawnEnvelope((-20.0, -10.0), _RE_CENTER_Y),
-            "behind_far": SpawnEnvelope((-35.0, -18.0), _RE_CENTER_Y),
-            "side_same": SpawnEnvelope((-8.0, 8.0), _RE_CENTER_Y, (1.0, 2.5)),
-            "side_opposite": SpawnEnvelope((-8.0, 8.0), _RE_CENTER_Y, (1.0, 2.5)),
-            "ahead": SpawnEnvelope((10.0, 25.0), _RE_AHEAD_Y, _RE_AHEAD_SPEED),
+            "behind_near": SpawnEnvelope(_BEHIND_NEAR.rel_x, _RE_CENTER_Y, _BEHIND_NEAR.speed_delta),
+            "behind_far": SpawnEnvelope(_BEHIND_FAR.rel_x, _RE_CENTER_Y, _BEHIND_FAR.speed_delta),
+            "side_same": SpawnEnvelope(_SIDE_X.rel_x, _RE_CENTER_Y, _SIDE_X.speed_delta),
+            "side_opposite": SpawnEnvelope(_SIDE_X.rel_x, _RE_CENTER_Y, _SIDE_X.speed_delta),
+            "ahead": SpawnEnvelope(_AHEAD.rel_x, _RE_AHEAD_Y, _RE_AHEAD_SPEED),
         }
     else:
         raise ValueError(f"unknown crash_type: {crash_type}")
 
     return {
-        "behind_near": SpawnEnvelope(_BEHIND_NEAR.rel_x, same_y),
-        "behind_far": SpawnEnvelope(_BEHIND_FAR.rel_x, same_y),
-        "side_same": SpawnEnvelope(_SIDE_X.rel_x, same_y, (0.8, 2.0)),
-        "side_opposite": SpawnEnvelope(_SIDE_X.rel_x, opp_y, (0.8, 2.0)),
-        "ahead": SpawnEnvelope(_AHEAD.rel_x, (-0.8, 0.8), (-0.5, 1.5)),
+        "behind_near": SpawnEnvelope(_BEHIND_NEAR.rel_x, same_y, _BEHIND_NEAR.speed_delta),
+        "behind_far": SpawnEnvelope(_BEHIND_FAR.rel_x, same_y, _BEHIND_FAR.speed_delta),
+        "side_same": SpawnEnvelope(_SIDE_X.rel_x, same_y, _SIDE_X.speed_delta),
+        "side_opposite": SpawnEnvelope(_SIDE_X.rel_x, opp_y, (1.5, 3.0)),
+        "ahead": SpawnEnvelope(_AHEAD.rel_x, same_y, (0.0, 1.5)),
     }
 
 

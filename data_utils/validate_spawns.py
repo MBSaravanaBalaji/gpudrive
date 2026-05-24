@@ -26,8 +26,40 @@ from typing import List, Tuple
 
 import torch
 
-from collision_classifier.ppo_env import PROBE_ACTION_IDX, CrashVecEnv
+from collision_classifier.ppo_env import PROBE_ACTION_IDX, CrashVecEnv, _REALISTIC_ACCEL_VALUES, _REALISTIC_STEER_VALUES
 from data_utils.spawn_families import infer_spawn_family_from_path
+
+MIN_EGO_VALID_STEPS = 80
+
+
+def _action_idx(accel: float, steer: float) -> int:
+    ai = _REALISTIC_ACCEL_VALUES.index(accel)
+    sj = _REALISTIC_STEER_VALUES.index(steer)
+    return ai * len(_REALISTIC_STEER_VALUES) + sj
+
+
+PROBE_ACTIONS = (
+    _action_idx(0.5, -0.2),
+    PROBE_ACTION_IDX,
+    _action_idx(0.5, 0.2),
+)
+
+
+def _ego_valid_steps(path: str) -> int:
+    try:
+        with open(path) as f:
+            scene = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    objects = scene.get("objects", [])
+    if len(objects) < 2:
+        return 0
+    ego = objects[1]
+    valid = ego.get("valid", [])
+    if valid:
+        return sum(1 for v in valid if v)
+    pos = ego.get("position", [])
+    return len(pos) if isinstance(pos, list) else 0
 
 
 def _load_scene_paths(data_dir: str) -> List[str]:
@@ -46,21 +78,25 @@ def validate_batch(
     """Return (path, ok, reason) for each scene in paths."""
     env.load_scene_paths(paths)
     offroad_any = torch.zeros(env.num_worlds, dtype=torch.bool, device=env.device)
-    for _ in range(probe_steps):
-        actions = torch.full(
-            (env.num_worlds,),
-            PROBE_ACTION_IDX,
-            dtype=torch.long,
-            device=env.device,
-        )
-        _, _, _, infos = env.step(actions)
-        for w, info in enumerate(infos):
-            if info.get("offroad"):
-                offroad_any[w] = True
+    steps_per_probe = max(1, probe_steps // len(PROBE_ACTIONS))
+    for probe_idx in PROBE_ACTIONS:
+        for _ in range(steps_per_probe):
+            actions = torch.full(
+                (env.num_worlds,),
+                probe_idx,
+                dtype=torch.long,
+                device=env.device,
+            )
+            _, _, _, infos = env.step(actions)
+            for w, info in enumerate(infos):
+                if info.get("offroad"):
+                    offroad_any[w] = True
 
     results: List[Tuple[str, bool, str]] = []
     for w, path in enumerate(paths):
-        if offroad_any[w].item():
+        if _ego_valid_steps(path) < MIN_EGO_VALID_STEPS:
+            results.append((path, False, "ego_valid_short"))
+        elif offroad_any[w].item():
             results.append((path, False, "offroad"))
         else:
             results.append((path, True, "ok"))
@@ -86,16 +122,20 @@ def run(
     bad: List[str] = []
     family_stats: dict[str, dict[str, int]] = {}
 
-    for start in range(0, len(paths), num_worlds):
-        chunk = paths[start : start + num_worlds]
-        env = CrashVecEnv(
+    def _make_env(n_worlds: int) -> CrashVecEnv:
+        return CrashVecEnv(
             crash_type=crash_type,
-            num_worlds=len(chunk),
+            num_worlds=n_worlds,
             data_dir=data_dir,
-            dataset_size=min(dataset_size, len(chunk)),
+            dataset_size=n_worlds,
             device=device,
         )
-        results = validate_batch(env, chunk, probe_steps)
+
+    env = _make_env(num_worlds)
+    for start in range(0, len(paths), num_worlds):
+        chunk = paths[start : start + num_worlds]
+        batch_env = env if len(chunk) == num_worlds else _make_env(len(chunk))
+        results = validate_batch(batch_env, chunk, probe_steps)
         for path, ok, _reason in results:
             family = "unknown"
             try:
@@ -139,7 +179,7 @@ def main() -> None:
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--crash_type", required=True, choices=["ssl", "ssr", "re"])
     parser.add_argument("--num_worlds", type=int, default=32)
-    parser.add_argument("--probe_steps", type=int, default=15)
+    parser.add_argument("--probe_steps", type=int, default=30)
     parser.add_argument("--dataset_size", type=int, default=10_000)
     parser.add_argument("--delete_invalid", action="store_true")
     parser.add_argument("--reject_log", type=str, default=None)

@@ -272,7 +272,7 @@ class CrashEnv:
         ego_h = float(ego[7])
         cos_h, sin_h = np.cos(ego_h), np.sin(ego_h)
         local_x =  cos_h * dx + sin_h * dy
-        local_y = -sin_h * dx + cos_h * dy
+        local_y =  sin_h * dx - cos_h * dy  # + = ego's right (matches ppo_env)
 
         unit = np.array([local_x / d, local_y / d])
         alignment = float(np.dot(unit, self.target_dir))

@@ -1,15 +1,11 @@
 """
 PPO training for adversarial crash NPC using GPUDrive's native IPPO infrastructure.
 
-Usage:
-  cd /path/to/gpudrive
-  .venv/bin/python -m collision_classifier.ppo_train --crash_type ssl
-  .venv/bin/python -m collision_classifier.ppo_train --crash_type ssr
-  .venv/bin/python -m collision_classifier.ppo_train --crash_type re
+See collision_classifier/TRAINING.md for full instructions (SSL / SSR / RE),
+checkpoint naming, and how to avoid overwriting production models.
 
-Outputs:
-  collision_classifier/checkpoints/<crash_type>_ppo_best   — best crash-rate checkpoint
-  collision_classifier/checkpoints/<crash_type>_ppo_last   — periodic checkpoint
+Usage:
+  .venv/bin/python -m collision_classifier.ppo_train --crash_type ssl --checkpoint_tag multispawn ...
 """
 from __future__ import annotations
 
@@ -25,8 +21,13 @@ _DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 from gpudrive.integrations.sb3.ppo import IPPO
 from gpudrive.networks.basic_ffn import FFN, FeedForwardPolicy
+from gpudrive.networks.perm_eq_late_fusion import LateFusionNet, LateFusionPolicy
 
 from collision_classifier.ppo_env import CrashVecEnv
+from collision_classifier.checkpoint_utils import (
+    checkpoint_input_dim,
+    load_ippo_with_obs_expand,
+)
 
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 
@@ -40,6 +41,7 @@ class CrashCallback(BaseCallback):
         save_every: int = 50_000,
         resample_scenes: bool = False,
         finetune: bool = False,
+        checkpoint_tag: str | None = None,
     ):
         super().__init__(verbose=0)
         self.env = env
@@ -47,7 +49,15 @@ class CrashCallback(BaseCallback):
         self.log_every = log_every
         self.save_every = save_every
         self.resample_scenes = resample_scenes
-        self.best_name = f"{crash_type}_ppo_finetune_best" if finetune else f"{crash_type}_ppo_best"
+        base = f"{crash_type}_ppo_{checkpoint_tag}" if checkpoint_tag else f"{crash_type}_ppo"
+        suffix = "_finetune_best" if finetune else "_best"
+        self.best_name = f"{base}{suffix}"
+        if checkpoint_tag:
+            self.last_name = f"{base}_last"
+        elif finetune:
+            self.last_name = f"{crash_type}_ppo_finetune_last"
+        else:
+            self.last_name = f"{crash_type}_ppo_last"
         self.best_crash_rate = 0.0
         self.t0 = time.time()
 
@@ -92,7 +102,7 @@ class CrashCallback(BaseCallback):
                 print(f"Saved → {path}.zip")
 
         if n % self.save_every == 0 and n > 0:
-            path = os.path.join(CHECKPOINT_DIR, f"{self.crash_type}_ppo_last")
+            path = os.path.join(CHECKPOINT_DIR, self.last_name)
             self.model.save(path)
 
         return True
@@ -116,6 +126,10 @@ def train(
     load_checkpoint: str | None = None,
     learning_rate: float = 3e-4,
     spawn_cond: bool = False,
+    spawn_family: str | None = None,
+    checkpoint_tag: str | None = None,
+    late_fusion: bool = False,
+    reset_timesteps: bool = False,
 ):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -123,7 +137,8 @@ def train(
     print(
         f"  total_steps={total_steps}  num_worlds={num_worlds}  device={device}  "
         f"resample_scenes={resample_scenes}  spawn_cond={spawn_cond}  "
-        f"load_checkpoint={load_checkpoint}\n"
+        f"spawn_family={spawn_family}  checkpoint_tag={checkpoint_tag}  "
+        f"load_checkpoint={load_checkpoint}  late_fusion={late_fusion}\n"
     )
 
     env = CrashVecEnv(
@@ -134,28 +149,81 @@ def train(
         seed=seed,
         device=device,
         spawn_cond=spawn_cond,
+        spawn_family=spawn_family,
+        late_fusion=late_fusion,
     )
 
     # n_steps = one full episode per world per rollout
-    n_steps = env.episode_len  # 91
+    n_steps = env.episode_len
     batch_size = max(1, (num_worlds * n_steps) // 5)  # 5 minibatches
 
-    # Minimal exp_config stub — IPPO stores it but only checks resample_scenes
-    exp_config = SimpleNamespace(resample_scenes=False)
+    exp_config = SimpleNamespace(
+        resample_scenes=resample_scenes,
+        ego_state_layers=[64, 32],
+        road_object_layers=[64, 64],
+        road_graph_layers=[64, 64],
+        shared_layers=[64, 64],
+        act_func="tanh",
+        dropout=0.0,
+        last_layer_dim_pi=64,
+        last_layer_dim_vf=64,
+        spawn_extra_dim=CrashVecEnv.OBS_SPAWN_DIM if spawn_cond and late_fusion else 0,
+    )
+    env_config = env.env_config if late_fusion else None
+    mlp_class = LateFusionNet if late_fusion else FFN
+    policy_class = LateFusionPolicy if late_fusion else FeedForwardPolicy
 
     if load_checkpoint:
-        model = IPPO.load(
-            load_checkpoint,
-            env=env,
-            custom_objects={"mlp_class": FFN, "policy_class": FeedForwardPolicy},
-            device=device,
-        )
-        model.learning_rate = learning_rate
+        if late_fusion:
+            model = IPPO.load(
+                load_checkpoint,
+                env=env,
+                custom_objects={
+                    "mlp_class": LateFusionNet,
+                    "policy_class": LateFusionPolicy,
+                },
+                device=device,
+            )
+            model.learning_rate = learning_rate
+            if model.n_steps != n_steps:
+                print(f"  n_steps {model.n_steps}→{n_steps} (episode length changed)")
+                model.n_steps = n_steps
+                model.rollout_buffer.n_steps = n_steps
+                model.rollout_buffer.reset()
+        else:
+            ckpt_dim = checkpoint_input_dim(load_checkpoint, device=device)
+            if env.obs_dim > ckpt_dim:
+                model = load_ippo_with_obs_expand(
+                    load_checkpoint,
+                    env,
+                    device=device,
+                    n_steps=n_steps,
+                    batch_size=batch_size,
+                    seed=seed,
+                    learning_rate=learning_rate,
+                )
+            else:
+                model = IPPO.load(
+                    load_checkpoint,
+                    env=env,
+                    custom_objects={"mlp_class": FFN, "policy_class": FeedForwardPolicy},
+                    device=device,
+                )
+                model.learning_rate = learning_rate
+                if model.n_steps != n_steps:
+                    print(f"  n_steps {model.n_steps}→{n_steps} (episode length changed)")
+                    model.n_steps = n_steps
+                    model.rollout_buffer.n_steps = n_steps
+                    model.rollout_buffer.reset()
         start_steps = model.num_timesteps
+        if reset_timesteps:
+            model.num_timesteps = 0
+            start_steps = 0
         target_steps = start_steps + total_steps
         print(
             f"Warm start from {load_checkpoint}  lr={learning_rate}  "
             f"start_steps={start_steps}  target_steps={target_steps}"
+            + ("  (timesteps reset)" if reset_timesteps else "")
         )
     else:
         start_steps = 0
@@ -167,17 +235,17 @@ def train(
             seed=seed,
             verbose=0,
             device=device,
-            mlp_class=FFN,
-            policy=FeedForwardPolicy,
+            mlp_class=mlp_class,
+            policy=policy_class,
             gamma=0.99,
             gae_lambda=0.95,
             vf_coef=0.5,
             clip_range=0.2,
             learning_rate=learning_rate,
-            ent_coef=0.03,       # entropy bonus — keeps policy exploring; needs to be higher when terminal is sparse
+            ent_coef=0.03,
             n_epochs=5,
             max_grad_norm=0.5,
-            env_config=None,     # only needed for LateFusionNet
+            env_config=env_config,
             exp_config=exp_config,
         )
 
@@ -188,15 +256,16 @@ def train(
         save_every=save_every,
         resample_scenes=resample_scenes,
         finetune=load_checkpoint is not None,
+        checkpoint_tag=checkpoint_tag,
     )
 
     model.learn(
         total_timesteps=target_steps,
         callback=callback,
-        reset_num_timesteps=False,
+        reset_num_timesteps=reset_timesteps or load_checkpoint is None,
     )
 
-    path = os.path.join(CHECKPOINT_DIR, f"{crash_type}_ppo_last")
+    path = os.path.join(CHECKPOINT_DIR, callback.last_name)
     model.save(path)
     print(f"\nDone. Best crash rate: {callback.best_crash_rate:.3f}")
     print(f"Final checkpoint: {path}.zip")
@@ -223,6 +292,29 @@ if __name__ == "__main__":
         action="store_true",
         help="Add spawn-family conditioning to obs (15-dim). Required for multi_spawn datasets.",
     )
+    parser.add_argument(
+        "--spawn_family",
+        type=str,
+        default=None,
+        choices=["behind_near", "behind_far", "side_same", "side_opposite", "ahead"],
+        help="Curriculum: train on one spawn family only (filters scene filenames).",
+    )
+    parser.add_argument(
+        "--checkpoint_tag",
+        type=str,
+        default=None,
+        help="Checkpoint name tag, e.g. multispawn → ssr_ppo_multispawn_best.zip",
+    )
+    parser.add_argument(
+        "--late_fusion",
+        action="store_true",
+        help="Use GPUDrive road/partner obs with LateFusionNet (train from scratch)",
+    )
+    parser.add_argument(
+        "--reset_timesteps",
+        action="store_true",
+        help="Load weights only: reset PPO step counter (fresh curriculum on warm start)",
+    )
     args = parser.parse_args()
 
     train(
@@ -239,4 +331,8 @@ if __name__ == "__main__":
         load_checkpoint=args.load_checkpoint,
         learning_rate=args.learning_rate,
         spawn_cond=args.spawn_cond,
+        spawn_family=args.spawn_family,
+        checkpoint_tag=args.checkpoint_tag,
+        late_fusion=args.late_fusion,
+        reset_timesteps=args.reset_timesteps,
     )
